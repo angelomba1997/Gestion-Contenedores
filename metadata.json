@@ -1,0 +1,5 @@
+{
+  "name": "Gestión de Contenedores",
+  "description": "Una aplicación para que los establecimientos gestionen las solicitudes de contenedores de residuos, especificando fracciones, capacidades y viendo el estado logístico de cada solicitud.",
+  "requestFramePermissions": []
+}
