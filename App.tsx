@@ -1,19 +1,31 @@
-import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { Header } from './components/Header';
 import { RequestForm } from './components/RequestForm';
 import { RequestList } from './components/RequestList';
 import { FilterControls } from './components/FilterControls';
 import { Inventory } from './components/Inventory';
 import { PendingDeliveries } from './components/PendingDeliveries';
-import { INITIAL_REQUESTS, INITIAL_INVENTORY, FRACTIONS } from './constants';
+import { FRACTIONS } from './constants';
 import type { ContainerRequest, Filters, InventoryItem, RequestItemDetail, Fraction } from './types';
 import { StatusEnum, RequestTypeEnum } from './types';
+import { db } from './firebase';
+import { 
+  collection, 
+  getDocs, 
+  addDoc, 
+  deleteDoc, 
+  doc, 
+  setDoc, 
+  Timestamp, 
+  writeBatch,
+  runTransaction
+} from 'firebase/firestore';
 
 const recalculateRequestStatuses = (
   allRequests: ContainerRequest[],
   currentInventory: InventoryItem[]
 ): ContainerRequest[] => {
-  // Use a Map for easier, more reliable inventory tracking during the calculation.
   const tempInventory = new Map<string, number>();
   currentInventory.forEach(item => {
     const key = `${item.fractionId}-${item.capacity}`;
@@ -23,7 +35,6 @@ const recalculateRequestStatuses = (
   const completedRequests = allRequests.filter(req => req.statusId === StatusEnum.REALIZADO);
   const pendingRequests = allRequests.filter(req => req.statusId !== StatusEnum.REALIZADO);
 
-  // Sort pending requests by date, oldest first, to establish priority
   pendingRequests.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
   const updatedPendingRequests = pendingRequests.map(req => {
@@ -40,19 +51,16 @@ const recalculateRequestStatuses = (
 
     const itemsToAdd = Object.values(aggregatedItems);
     
-    // For requests that only remove items, they are always "in preparation".
     if (itemsToAdd.length === 0) {
         return { ...req, statusId: StatusEnum.EN_PREPARACION, statusDetail: undefined };
     }
 
-    // Check if the entire request is possible with the current temp inventory.
     const isPossible = itemsToAdd.every(item => {
         const key = `${item.fractionId}-${item.capacity}`;
         return (tempInventory.get(key) ?? 0) >= item.count;
     });
 
     if (isPossible) {
-        // If possible, "reserve" the stock in our temporary inventory map.
         itemsToAdd.forEach(item => {
             const key = `${item.fractionId}-${item.capacity}`;
             const currentStock = tempInventory.get(key) ?? 0;
@@ -60,8 +68,6 @@ const recalculateRequestStatuses = (
         });
         return { ...req, statusId: StatusEnum.EN_PREPARACION, statusDetail: undefined };
     } else {
-        // If not possible, generate a detailed status message.
-        // Importantly, tempInventory is NOT modified for impossible requests.
         const statusDetails = itemsToAdd.map(item => {
             const key = `${item.fractionId}-${item.capacity}`;
             const availableQuantity = tempInventory.get(key) ?? 0;
@@ -91,13 +97,9 @@ const recalculateRequestStatuses = (
 type View = 'requests' | 'inventory' | 'pending';
 
 export default function App() {
-  const [requests, setRequests] = useState<ContainerRequest[]>(INITIAL_REQUESTS);
-  const [inventory, setInventory] = useState<InventoryItem[]>(INITIAL_INVENTORY);
-  const [establishments, setEstablishments] = useState<string[]>(() => {
-    const defaultExamples = ['Establecimiento A', 'Establecimiento B', 'Establecimiento C'];
-    const establishmentSet = new Set([...defaultExamples, ...INITIAL_REQUESTS.map(req => req.establishment)]);
-    return Array.from(establishmentSet).sort();
-  });
+  const [requests, setRequests] = useState<ContainerRequest[]>([]);
+  const [inventory, setInventory] = useState<InventoryItem[]>([]);
+  const [establishments, setEstablishments] = useState<string[]>([]);
   const [filters, setFilters] = useState<Filters>({
     fractionId: 'ALL',
     capacity: 'ALL',
@@ -105,119 +107,180 @@ export default function App() {
     establishment: 'ALL',
   });
   const [activeView, setActiveView] = useState<View>('requests');
+  const [loading, setLoading] = useState(true);
 
-  const nextRequestId = useRef<number>(
-    (() => {
-        const existingIds = INITIAL_REQUESTS.map(r => parseInt(r.id, 10)).filter(id => !isNaN(id));
-        const maxId = existingIds.length > 0 ? Math.max(...existingIds) : 0;
-        return maxId + 1;
-    })()
-  );
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    try {
+      // Fetch establishments
+      const estSnapshot = await getDocs(collection(db, 'establishments'));
+      const estList = estSnapshot.docs.map(doc => doc.id).sort();
+      
+      const defaultExamples = ['Establecimiento A', 'Establecimiento B', 'Establecimiento C'];
+      const establishmentSet = new Set([...defaultExamples, ...estList]);
+      setEstablishments(Array.from(establishmentSet).sort());
+
+      // Fetch inventory
+      const invSnapshot = await getDocs(collection(db, 'inventory'));
+      const invList: InventoryItem[] = invSnapshot.docs.map(doc => {
+        const data = doc.data();
+        return {
+          fractionId: data.fractionId,
+          capacity: data.capacity,
+          quantity: data.quantity,
+          lastUpdated: (data.lastUpdated as Timestamp).toDate().toISOString(),
+        };
+      });
+      setInventory(invList);
+
+      // Fetch requests
+      const reqSnapshot = await getDocs(collection(db, 'requests'));
+      const reqList: ContainerRequest[] = reqSnapshot.docs.map(doc => {
+        const data = doc.data();
+        return {
+          id: doc.id,
+          establishment: data.establishment,
+          items: data.items,
+          statusId: data.statusId,
+          statusDetail: data.statusDetail || undefined,
+          date: (data.date as Timestamp).toDate().toISOString(),
+          observations: data.observations,
+        };
+      });
+      
+      setRequests(recalculateRequestStatuses(reqList, invList));
+
+    } catch (error) {
+      console.error("Error fetching data from Firestore:", error);
+      alert("Error al cargar los datos. Por favor, revise la consola para más detalles.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    // Recalculate statuses on initial load based on inventory and priority
-    setRequests(prevRequests => recalculateRequestStatuses(prevRequests, inventory));
-  }, []); // Empty dependency array means this runs once on mount
+    fetchData();
+  }, [fetchData]);
 
-  const handleImportEstablishments = useCallback((csvText: string) => {
+  const handleImportEstablishments = useCallback(async (csvText: string) => {
     if (!csvText) return;
     const imported = csvText
       .split('\n')
       .map(row => {
           const firstColumn = row.split(',')[0];
-          return firstColumn.replace(/;+/g, '').trim(); // Clean up semicolons and trim
+          return firstColumn.replace(/;+/g, '').trim();
       })
-      .filter(Boolean); // Filter out empty strings
+      .filter(Boolean);
 
-    const defaultExamples = ['Establecimiento A', 'Establecimiento B', 'Establecimiento C'];
+    try {
+        const batch = writeBatch(db);
+        imported.forEach(name => {
+            const docRef = doc(db, 'establishments', name);
+            batch.set(docRef, { name });
+        });
+        await batch.commit();
+        alert(`${imported.length} establecimientos importados/actualizados con éxito.`);
+        await fetchData();
+    } catch (error) {
+        console.error("Error importing establishments:", error);
+        alert("Error al importar establecimientos.");
+    }
+  }, [fetchData]);
 
-    setEstablishments(prev => {
-      const filteredPrev = prev.filter(est => !defaultExamples.includes(est));
-      const combined = [...filteredPrev, ...imported];
-      const unique = Array.from(new Set(combined));
-      return unique.sort();
-    });
-  }, []);
+  const addRequest = useCallback(async (newRequest: Omit<ContainerRequest, 'id' | 'statusId'>) => {
+    try {
+        const requestWithTimestamp = {
+            ...newRequest,
+            date: Timestamp.fromDate(new Date(newRequest.date)),
+            statusId: StatusEnum.EN_PREPARACION, 
+        };
+        await addDoc(collection(db, 'requests'), requestWithTimestamp);
+        await fetchData();
+    } catch (error) {
+        console.error("Error adding request:", error);
+        alert("Error al añadir la solicitud.");
+    }
+  }, [fetchData]);
 
-  const addRequest = useCallback((newRequest: Omit<ContainerRequest, 'id' | 'statusId'>) => {
-    setRequests(currentRequests => {
-      const requestWithMetadata: ContainerRequest = {
-        ...newRequest,
-        id: (nextRequestId.current++).toString(),
-        statusId: StatusEnum.EN_PREPARACION, // Placeholder, will be recalculated
-      };
-      const newRequestsList = [requestWithMetadata, ...currentRequests];
-      return recalculateRequestStatuses(newRequestsList, inventory);
-    });
-  }, [inventory]);
+  const deleteRequest = useCallback(async (idToDelete: string) => {
+    try {
+        await deleteDoc(doc(db, 'requests', idToDelete));
+        await fetchData();
+    } catch (error) {
+        console.error("Error deleting request:", error);
+        alert("Error al eliminar la solicitud.");
+    }
+  }, [fetchData]);
 
-  const deleteRequest = useCallback((idToDelete: string) => {
-    setRequests(currentRequests => {
-        const updatedRequests = currentRequests.filter(req => req.id !== idToDelete);
-        // Recalculate statuses as deleting a request might free up inventory
-        return recalculateRequestStatuses(updatedRequests, inventory);
-    });
-  }, [inventory]);
-
-  const markRequestAsDelivered = useCallback((idToDeliver: string) => {
+  const markRequestAsDelivered = useCallback(async (idToDeliver: string) => {
     const requestToDeliver = requests.find(req => req.id === idToDeliver);
     if (!requestToDeliver || requestToDeliver.statusId === StatusEnum.REALIZADO) return;
 
-    // Create a new inventory based on the delivery
-    const newInventory: InventoryItem[] = JSON.parse(JSON.stringify(inventory));
-    const now = new Date().toISOString();
+    try {
+      await runTransaction(db, async (transaction) => {
+        const requestDocRef = doc(db, "requests", idToDeliver);
+        const requestDoc = await transaction.get(requestDocRef);
+        if (!requestDoc.exists()) {
+          throw new Error("¡La solicitud no existe!");
+        }
 
-    for (const item of requestToDeliver.items) {
-      let stockItem = newInventory.find(inv => inv.fractionId === item.fractionId && inv.capacity === item.capacity);
-      
-      if (!stockItem) {
-        stockItem = { fractionId: item.fractionId, capacity: item.capacity, quantity: 0, lastUpdated: now };
-        newInventory.push(stockItem);
-      }
+        const requestData = requestDoc.data();
+        const now = Timestamp.now();
 
-      if (item.requestType === RequestTypeEnum.ADD) {
-        stockItem.quantity = Math.max(0, stockItem.quantity - 1);
-      } else if (item.requestType === RequestTypeEnum.REMOVE) {
-        stockItem.quantity += 1;
-      }
-      stockItem.lastUpdated = now;
-    }
-    
-    // Mark the request as delivered
-    const requestsWithDelivered = requests.map(req => 
-        req.id === idToDeliver ? { ...req, statusId: StatusEnum.REALIZADO, statusDetail: undefined } : req
-    );
-    
-    // Recalculate statuses for all requests with the new inventory
-    const finalRequests = recalculateRequestStatuses(requestsWithDelivered, newInventory);
-
-    // Set both states
-    setInventory(newInventory);
-    setRequests(finalRequests);
-  }, [requests, inventory]);
-
-  const updateInventory = useCallback((updatedItem: Omit<InventoryItem, 'lastUpdated'>) => {
-    setInventory(currentInventory => {
-        const now = new Date().toISOString();
-        let itemExists = false;
-        const newInventory = currentInventory.map(item => {
-          if (item.fractionId === updatedItem.fractionId && item.capacity === updatedItem.capacity) {
-            itemExists = true;
-            return { ...item, quantity: updatedItem.quantity, lastUpdated: now };
+        for (const item of requestData.items) {
+          const invDocId = `${item.fractionId}-${item.capacity}`;
+          const invDocRef = doc(db, "inventory", invDocId);
+          const invDoc = await transaction.get(invDocRef);
+          
+          let newQuantity: number;
+          if (invDoc.exists()) {
+            const currentQuantity = invDoc.data().quantity;
+            if (item.requestType === RequestTypeEnum.ADD) {
+              newQuantity = Math.max(0, currentQuantity - 1);
+            } else { // REMOVE
+              newQuantity = currentQuantity + 1;
+            }
+            transaction.update(invDocRef, { quantity: newQuantity, lastUpdated: now });
+          } else {
+            if (item.requestType === RequestTypeEnum.ADD) {
+              newQuantity = 0; 
+            } else { // REMOVE
+              newQuantity = 1;
+            }
+            transaction.set(invDocRef, { 
+                fractionId: item.fractionId, 
+                capacity: item.capacity, 
+                quantity: newQuantity, 
+                lastUpdated: now 
+            });
           }
-          return item;
-        });
-
-        if (!itemExists) {
-          newInventory.push({ ...updatedItem, lastUpdated: now });
         }
         
-        // After inventory update, recalculate status for all requests
-        setRequests(currentRequests => recalculateRequestStatuses(currentRequests, newInventory));
-        
-        return newInventory;
-    });
-  }, []);
+        transaction.update(requestDocRef, { statusId: StatusEnum.REALIZADO, statusDetail: null });
+      });
+      
+      await fetchData();
+
+    } catch (e) {
+      console.error("Transaction failed: ", e);
+      alert("Error al marcar la solicitud como entregada. La operación fue revertida.");
+    }
+  }, [requests, fetchData]);
+
+
+  const updateInventory = useCallback(async (updatedItem: Omit<InventoryItem, 'lastUpdated'>) => {
+    try {
+      const docId = `${updatedItem.fractionId}-${updatedItem.capacity}`;
+      await setDoc(doc(db, 'inventory', docId), {
+          ...updatedItem,
+          lastUpdated: Timestamp.now()
+      }, { merge: true });
+      await fetchData();
+    } catch(error) {
+        console.error("Error updating inventory:", error);
+        alert("Error al actualizar el inventario.");
+    }
+  }, [fetchData]);
 
   const filteredRequests = useMemo(() => {
     return requests
@@ -231,7 +294,6 @@ export default function App() {
         if (filters.capacity === 'ALL') return true;
         return req.items.some(item => item.capacity === filters.capacity);
       })
-      // sort by date desc to show newest first
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
   }, [requests, filters]);
 
@@ -257,7 +319,6 @@ export default function App() {
                 };
             }
             
-            // Increment the count based on the request's status
             if (req.statusId === StatusEnum.EN_PREPARACION || req.statusId === StatusEnum.SIN_STOCK) {
                 summary[key][req.statusId]++;
             }
@@ -272,16 +333,13 @@ export default function App() {
   const realTimeAvailability = useMemo(() => {
     const availability = new Map<string, number>();
 
-    // 1. Start with the base inventory
     inventory.forEach(item => {
         const key = `${item.fractionId}-${item.capacity}`;
         availability.set(key, item.quantity);
     });
 
-    // 2. Find all pending requests
     const pendingRequests = requests.filter(req => req.statusId !== StatusEnum.REALIZADO);
 
-    // 3. Subtract all ADD items from pending requests from the availability map
     for (const req of pendingRequests) {
         for (const item of req.items) {
             if (item.requestType === RequestTypeEnum.ADD) {
@@ -294,7 +352,20 @@ export default function App() {
     
     return availability;
   }, [requests, inventory]);
-
+  
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-100">
+        <div className="text-center">
+            <svg className="mx-auto h-12 w-12 text-blue-500 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            <p className="mt-4 text-xl font-semibold text-slate-700">Cargando datos...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-100 font-sans text-slate-800">
