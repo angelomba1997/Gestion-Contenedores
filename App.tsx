@@ -6,6 +6,7 @@ import { RequestList } from './components/RequestList';
 import { FilterControls } from './components/FilterControls';
 import { Inventory } from './components/Inventory';
 import { PendingDeliveries } from './components/PendingDeliveries';
+import { Establishments } from './components/Establishments';
 import { FRACTIONS } from './constants';
 import type { ContainerRequest, Filters, InventoryItem, RequestItemDetail, Fraction } from './types';
 import { StatusEnum, RequestTypeEnum } from './types';
@@ -19,8 +20,19 @@ import {
   setDoc, 
   Timestamp, 
   writeBatch,
-  runTransaction
+  runTransaction,
+  query,
+  where,
 } from 'firebase/firestore';
+
+/**
+ * Sanitizes a string to be used as a Firestore document ID.
+ * Replaces forward slashes, which are not allowed in document IDs.
+ * @param name The string to sanitize.
+ * @returns A sanitized string safe for use as a document ID.
+ */
+const sanitizeForDocId = (name: string) => name.replace(/\//g, '_');
+
 
 const recalculateRequestStatuses = (
   allRequests: ContainerRequest[],
@@ -94,7 +106,7 @@ const recalculateRequestStatuses = (
 };
 
 
-type View = 'requests' | 'inventory' | 'pending';
+type View = 'requests' | 'inventory' | 'pending' | 'establishments';
 
 export default function App() {
   const [requests, setRequests] = useState<ContainerRequest[]>([]);
@@ -114,11 +126,8 @@ export default function App() {
     try {
       // Fetch establishments
       const estSnapshot = await getDocs(collection(db, 'establishments'));
-      const estList = estSnapshot.docs.map(doc => doc.id).sort();
-      
-      const defaultExamples = ['Establecimiento A', 'Establecimiento B', 'Establecimiento C'];
-      const establishmentSet = new Set([...defaultExamples, ...estList]);
-      setEstablishments(Array.from(establishmentSet).sort());
+      const estList = estSnapshot.docs.map(doc => doc.data().name).sort();
+      setEstablishments(estList);
 
       // Fetch inventory
       const invSnapshot = await getDocs(collection(db, 'inventory'));
@@ -175,7 +184,8 @@ export default function App() {
     try {
         const batch = writeBatch(db);
         imported.forEach(name => {
-            const docRef = doc(db, 'establishments', name);
+            const docId = sanitizeForDocId(name);
+            const docRef = doc(db, 'establishments', docId);
             batch.set(docRef, { name });
         });
         await batch.commit();
@@ -281,6 +291,59 @@ export default function App() {
         alert("Error al actualizar el inventario.");
     }
   }, [fetchData]);
+
+  const addEstablishment = useCallback(async (name: string) => {
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+        throw new Error("El nombre no puede estar vacío.");
+    }
+    if (establishments.some(est => est.toLowerCase() === trimmedName.toLowerCase())) {
+        throw new Error("El establecimiento ya existe.");
+    }
+    const docId = sanitizeForDocId(trimmedName);
+    await setDoc(doc(db, 'establishments', docId), { name: trimmedName });
+    await fetchData();
+  }, [establishments, fetchData]);
+  
+  const deleteEstablishment = useCallback(async (name: string) => {
+      const isUsed = requests.some(r => r.establishment === name);
+      if (isUsed) {
+          throw new Error(`No se puede eliminar "${name}" porque está siendo utilizado en una o más solicitudes. Primero debe eliminar o modificar dichas solicitudes.`);
+      }
+      const docId = sanitizeForDocId(name);
+      await deleteDoc(doc(db, 'establishments', docId));
+      await fetchData();
+  }, [requests, fetchData]);
+
+  const updateEstablishment = useCallback(async (oldName: string, newName: string) => {
+      const trimmedNewName = newName.trim();
+      if (!trimmedNewName) {
+          throw new Error("El nombre no puede estar vacío.");
+      }
+      if (oldName === trimmedNewName) return;
+      if (establishments.some(est => est.toLowerCase() === trimmedNewName.toLowerCase() && est.toLowerCase() !== oldName.toLowerCase())) {
+          throw new Error(`El nombre "${trimmedNewName}" ya existe.`);
+      }
+
+      const requestsToUpdateQuery = query(collection(db, "requests"), where("establishment", "==", oldName));
+      const querySnapshot = await getDocs(requestsToUpdateQuery);
+      
+      const batch = writeBatch(db);
+      
+      querySnapshot.forEach((requestDoc) => {
+          batch.update(requestDoc.ref, { establishment: trimmedNewName });
+      });
+      
+      const oldDocId = sanitizeForDocId(oldName);
+      batch.delete(doc(db, "establishments", oldDocId));
+      
+      const newDocId = sanitizeForDocId(trimmedNewName);
+      batch.set(doc(db, "establishments", newDocId), { name: trimmedNewName });
+      
+      await batch.commit();
+      await fetchData();
+      return querySnapshot.size;
+  }, [establishments, fetchData]);
 
   const filteredRequests = useMemo(() => {
     return requests
@@ -406,6 +469,17 @@ export default function App() {
             >
               Inventario
             </button>
+             <button
+              onClick={() => setActiveView('establishments')}
+              className={`py-3 px-4 font-semibold text-lg transition-colors duration-200 ${
+                activeView === 'establishments'
+                  ? 'border-b-2 border-blue-600 text-blue-600'
+                  : 'text-slate-500 hover:text-blue-600'
+              }`}
+              aria-current={activeView === 'establishments' ? 'page' : undefined}
+            >
+              Mantenimiento
+            </button>
           </nav>
         </div>
 
@@ -415,7 +489,6 @@ export default function App() {
               <RequestForm 
                 onSubmit={addRequest} 
                 establishments={establishments} 
-                onImportEstablishments={handleImportEstablishments}
                 realTimeAvailability={realTimeAvailability}
               />
             </div>
@@ -437,6 +510,16 @@ export default function App() {
 
         {activeView === 'inventory' && (
            <Inventory inventory={inventory} onUpdateInventory={updateInventory} />
+        )}
+
+        {activeView === 'establishments' && (
+          <Establishments 
+            establishments={establishments}
+            onAdd={addEstablishment}
+            onUpdate={updateEstablishment}
+            onDelete={deleteEstablishment}
+            onImport={handleImportEstablishments}
+          />
         )}
       </main>
     </div>

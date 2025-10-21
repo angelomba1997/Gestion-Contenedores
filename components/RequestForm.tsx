@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef } from 'react';
 import { FRACTIONS } from '../constants';
 import { RequestTypeEnum } from '../types';
@@ -5,8 +6,6 @@ import type { Capacity, ContainerRequest, FractionEnum, RequestItemDetail } from
 import { TrashIcon } from './icons/TrashIcon';
 import { PlusIcon } from './icons/PlusIcon';
 import { XMarkIcon } from './icons/XMarkIcon';
-import { DocumentArrowUpIcon } from './icons/DocumentArrowUpIcon';
-
 
 interface ItemEditorProps {
     onAddItem: (item: Omit<RequestItemDetail, 'requestType'>) => void;
@@ -82,11 +81,10 @@ const ItemEditor: React.FC<ItemEditorProps> = ({ onAddItem, availableStock }) =>
 interface RequestFormProps {
     onSubmit: (newRequest: Omit<ContainerRequest, 'id' | 'statusId'>) => void;
     establishments: string[];
-    onImportEstablishments: (csvText: string) => void;
     realTimeAvailability: Map<string, number>;
 }
 
-export const RequestForm: React.FC<RequestFormProps> = ({ onSubmit, establishments, onImportEstablishments, realTimeAvailability }) => {
+export const RequestForm: React.FC<RequestFormProps> = ({ onSubmit, establishments, realTimeAvailability }) => {
     const [establishment, setEstablishment] = useState<string>('');
     const [requestDate, setRequestDate] = useState<string>(() => new Date().toISOString().split('T')[0]);
     const [requestTime, setRequestTime] = useState<string>(() => {
@@ -95,27 +93,6 @@ export const RequestForm: React.FC<RequestFormProps> = ({ onSubmit, establishmen
     });
     const [itemsToAdd, setItemsToAdd] = useState<RequestItemDetail[]>([]);
     const [itemsToRemove, setItemsToRemove] = useState<RequestItemDetail[]>([]);
-    const fileInputRef = useRef<HTMLInputElement>(null);
-
-    const handleImportClick = () => {
-        fileInputRef.current?.click();
-    };
-
-    const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0];
-        if (!file) return;
-
-        const reader = new FileReader();
-        reader.onload = (event) => {
-            const text = event.target?.result as string;
-            if (text) {
-                onImportEstablishments(text);
-                alert(`${text.split('\n').filter(Boolean).length} establecimientos importados con éxito.`);
-            }
-        };
-        reader.readAsText(file);
-        e.target.value = ''; // Reset file input to allow re-uploading same file
-    };
 
     const handleAddItem = (item: Omit<RequestItemDetail, 'requestType'>) => {
         setItemsToAdd(prev => [...prev, { ...item, requestType: RequestTypeEnum.ADD }]);
@@ -198,22 +175,6 @@ export const RequestForm: React.FC<RequestFormProps> = ({ onSubmit, establishmen
                         <datalist id="establishmentsDataList">
                             {establishments.map(est => <option key={est} value={est} />)}
                         </datalist>
-
-                        <input
-                            type="file"
-                            ref={fileInputRef}
-                            onChange={handleFileChange}
-                            accept=".csv"
-                            className="hidden"
-                        />
-                        <button
-                            type="button"
-                            onClick={handleImportClick}
-                            className="p-3 border border-slate-300 rounded-md hover:bg-slate-100 transition flex-shrink-0"
-                            title="Importar establecimientos (.csv)"
-                        >
-                            <DocumentArrowUpIcon className="w-6 h-6 text-slate-600" />
-                        </button>
                     </div>
                 </div>
 
