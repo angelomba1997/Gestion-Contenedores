@@ -223,59 +223,90 @@ export default function App() {
   }, [fetchData]);
 
   const markRequestAsDelivered = useCallback(async (idToDeliver: string) => {
-    const requestToDeliver = requests.find(req => req.id === idToDeliver);
-    if (!requestToDeliver || requestToDeliver.statusId === StatusEnum.REALIZADO) return;
-
     try {
       await runTransaction(db, async (transaction) => {
         const requestDocRef = doc(db, "requests", idToDeliver);
         const requestDoc = await transaction.get(requestDocRef);
+
         if (!requestDoc.exists()) {
           throw new Error("¡La solicitud no existe!");
         }
 
         const requestData = requestDoc.data();
-        const now = Timestamp.now();
-
-        for (const item of requestData.items) {
-          const invDocId = `${item.fractionId}-${item.capacity}`;
-          const invDocRef = doc(db, "inventory", invDocId);
-          const invDoc = await transaction.get(invDocRef);
-          
-          let newQuantity: number;
-          if (invDoc.exists()) {
-            const currentQuantity = invDoc.data().quantity;
-            if (item.requestType === RequestTypeEnum.ADD) {
-              newQuantity = Math.max(0, currentQuantity - 1);
-            } else { // REMOVE
-              newQuantity = currentQuantity + 1;
-            }
-            transaction.update(invDocRef, { quantity: newQuantity, lastUpdated: now });
-          } else {
-            if (item.requestType === RequestTypeEnum.ADD) {
-              newQuantity = 0; 
-            } else { // REMOVE
-              newQuantity = 1;
-            }
-            transaction.set(invDocRef, { 
-                fractionId: item.fractionId, 
-                capacity: item.capacity, 
-                quantity: newQuantity, 
-                lastUpdated: now 
-            });
-          }
+        
+        if (requestData.statusId === StatusEnum.REALIZADO) {
+          console.log("La solicitud ya ha sido marcada como realizada.");
+          return;
         }
         
+        // FIX: Guard against malformed request data.
+        // Ensure 'items' is a valid array to prevent crashes from bad data.
+        const requestItems = Array.isArray(requestData.items) ? requestData.items : [];
+        
+        const inventoryChanges = new Map<string, number>();
+        requestItems.forEach((item: RequestItemDetail) => {
+            // Check if item is a valid object with required properties before processing
+            if (item && item.fractionId && typeof item.capacity === 'number' && item.requestType) {
+                const invDocId = `${item.fractionId}-${item.capacity}`;
+                const currentChange = inventoryChanges.get(invDocId) ?? 0;
+                const change = item.requestType === RequestTypeEnum.ADD ? -1 : 1;
+                inventoryChanges.set(invDocId, currentChange + change);
+            } else {
+                console.warn(`Skipping malformed item in request ${idToDeliver}:`, item);
+            }
+        });
+        
+        // Only perform inventory reads/writes if there are valid changes to apply.
+        if (inventoryChanges.size > 0) {
+            const invDocIds = Array.from(inventoryChanges.keys());
+            const inventoryRefs = invDocIds.map(id => doc(db, "inventory", id));
+            const inventoryDocs = await Promise.all(inventoryRefs.map(ref => transaction.get(ref)));
+
+            const now = Timestamp.now();
+            invDocIds.forEach((invDocId, index) => {
+                const invDoc = inventoryDocs[index];
+                const change = inventoryChanges.get(invDocId)!;
+                const invDocRef = inventoryRefs[index];
+                
+                const currentQuantity = invDoc.exists() ? invDoc.data().quantity : 0;
+                const newQuantity = currentQuantity + change;
+
+                if (invDoc.exists()) {
+                    transaction.update(invDocRef, { quantity: newQuantity, lastUpdated: now });
+                } else {
+                    const [fractionId, capacity] = invDocId.split('-');
+                    transaction.set(invDocRef, {
+                        fractionId: fractionId,
+                        capacity: Number(capacity),
+                        quantity: newQuantity,
+                        lastUpdated: now
+                    });
+                }
+            });
+        }
+        
+        // Always update the request status, even if there were no inventory changes (e.g., malformed items).
         transaction.update(requestDocRef, { statusId: StatusEnum.REALIZADO, statusDetail: null });
       });
       
       await fetchData();
 
     } catch (e) {
-      console.error("Transaction failed: ", e);
-      alert("Error al marcar la solicitud como entregada. La operación fue revertida.");
+      console.error("Transaction failed: ", e); // Log the full error object for better debugging
+      if (e instanceof Error) {
+        if (e.message.includes("¡La solicitud no existe!")) {
+            alert("Error: La solicitud ya no existe y será eliminada de la vista.");
+            await fetchData();
+        } else if (e.message.includes("reads to be executed before all writes")) {
+           alert("Error al procesar la entrega: Hubo un problema de concurrencia. Por favor, inténtelo de nuevo.");
+        } else {
+            alert(`Error al marcar la solicitud como entregada: ${e.message}. La operación fue revertida.`);
+        }
+      } else {
+        alert("Ocurrió un error inesperado al marcar la solicitud como entregada.");
+      }
     }
-  }, [requests, fetchData]);
+  }, [fetchData]);
 
 
   const updateInventory = useCallback(async (updatedItem: Omit<InventoryItem, 'lastUpdated'>) => {
